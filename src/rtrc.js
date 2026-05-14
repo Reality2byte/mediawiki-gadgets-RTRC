@@ -17,98 +17,100 @@
    * Configuration
    * -------------------------------------------------
    */
-  // eslint-disable-next-line one-var
-  var
-    appVersion = 'v1.4.11',
-    conf = mw.config.get([
-      'skin',
-      'wgAction',
-      'wgCanonicalSpecialPageName',
-      'wgPageName',
-      'wgTitle',
-      'wgUserLanguage',
-      'wgDBname',
-      'wgScriptPath'
-    ]),
-    // Can't use mw.util.wikiScript until after #init
-    apiUrl = conf.wgScriptPath + '/api.php',
-    cvnApiUrl = 'https://cvn.wmcloud.org/api.php',
-    oresApiUrl = 'https://ores.wikimedia.org/v3/scores/' + conf.wgDBname,
-    oresModel = null,
-    intuitionLoadUrl = 'https://www.mediawiki.org/w/load.php?modules=ext.gadget.intuition&lang=en&only=scripts&raw=1',
-    docUrl = 'https://meta.wikimedia.org/wiki/User:Krinkle/Tools/Real-Time_Recent_Changes?uselang=' + conf.wgUserLanguage,
-    // 32x32px
-    ajaxLoaderUrl = 'https://upload.wikimedia.org/wikipedia/commons/d/de/Ajax-loader.gif',
-    annotations = {
-      // by RCID
-      patrolled: new Map(),
-      // by username
-      cvn: new Map(),
-      // by revision ID
-      ores: new Map()
+  const RTRC_VERSION = 'v1.4.11';
+  const conf = mw.config.get([
+    'skin',
+    'wgAction',
+    'wgCanonicalSpecialPageName',
+    'wgPageName',
+    'wgTitle',
+    'wgUserLanguage',
+    'wgDBname',
+    'wgScriptPath'
+  ]);
+  // Optimization: Avoid mw.util.wikiScript to let init() run initData() and dModules concurrently.
+  const MW_API_URL = conf.wgScriptPath + '/api.php';
+  const CVN_API_URL = 'https://cvn.wmcloud.org/api.php';
+  const ORES_API_URL = 'https://ores.wikimedia.org/v3/scores/' + conf.wgDBname;
+  const INTUITION_SCRIPT_URL = 'https://www.mediawiki.org/w/load.php?modules=ext.gadget.intuition&lang=en&only=scripts&raw=1';
+  const RTRC_DOC_URL = 'https://meta.wikimedia.org/wiki/User:Krinkle/Tools/Real-Time_Recent_Changes?uselang=' + conf.wgUserLanguage;
+  // 32x32px
+  const SPINNER_GIF_URL = 'https://upload.wikimedia.org/wikipedia/commons/d/de/Ajax-loader.gif';
+  // See annotationsCheck()
+  const ANNOTATION_CACHE_LIMIT = 1000;
+  const RTRC_DEF_OPT = {
+    rc: {
+      // Timestamp
+      start: undefined,
+      // Timestamp
+      end: undefined,
+      // Direction "older" (descending) or "newer" (ascending)
+      dir: 'older',
+      // Array of namespace ids
+      namespace: undefined,
+      // User name
+      user: undefined,
+      // Tag ID
+      tag: undefined,
+      // Filters
+      hideliu: false,
+      hidebots: true,
+      unpatrolled: false,
+      limit: 25,
+      // Type filters are "show matches only"
+      typeEdit: true,
+      typeNew: true
     },
-    // See annotationsCheck()
-    ANNOTATION_CACHE_LIMIT = 1000,
 
-    // Info from the wiki - see initData()
-    userHasPatrolRight = false,
-    rcTags = [],
-    wikiTimeOffset = 0,
+    app: {
+      refresh: 5,
+      cvnDB: false,
+      ores: false,
+      massPatrol: false,
+      autoDiff: false
+    }
+  };
+  const RTRC_ALIAS_OPT = {
+    // Back-compat with RTRC v1.0.4 and earlier
+    showAnonOnly: 'hideliu',
+    showUnpatrolledOnly: 'unpatrolled'
+  };
 
-    // State
-    updateFeedTimeout,
-    rcDayHeadPrev,
-    skippedRCIDs = [],
-    monthNames,
-    prevFeedHtml,
-    updateReq,
+  // Misc utilities and polyfils
+  const rAF = window.requestAnimationFrame || setTimeout;
 
-    // Default settings for the feed
-    defOpt = {
-      rc: {
-        // Timestamp
-        start: undefined,
-        // Timestamp
-        end: undefined,
-        // Direction "older" (descending) or "newer" (ascending)
-        dir: 'older',
-        // Array of namespace ids
-        namespace: undefined,
-        // User name
-        user: undefined,
-        // Tag ID
-        tag: undefined,
-        // Filters
-        hideliu: false,
-        hidebots: true,
-        unpatrolled: false,
-        limit: 25,
-        // Type filters are "show matches only"
-        typeEdit: true,
-        typeNew: true
-      },
+  // Cached info from the wiki, immutable after initData()
+  var oresModel = null;
+  var message;
+  var msg;
+  var userHasPatrolRight = false;
+  var rcTags = [];
+  var wikiTimeOffset = 0;
 
-      app: {
-        refresh: 5,
-        cvnDB: false,
-        ores: false,
-        massPatrol: false,
-        autoDiff: false
-      }
-    },
-    aliasOpt = {
-      // Back-compat for v1.0.4 and earlier
-      showAnonOnly: 'hideliu',
-      showUnpatrolledOnly: 'unpatrolled'
-    },
-    // Current settings for the feed
-    opt = makeOpt(),
+  // DOM refs, immutable after bindInterface()
+  var $wrapper;
+  var $body;
+  var $feed;
+  var $rcOptionsSubmit;
 
-    rAF = window.requestAnimationFrame || setTimeout,
-
-    message, msg,
-    currentDiff, currentDiffRcid,
-    $wrapper, $body, $feed, $rcOptionsSubmit;
+  // Dynamic state, mutable
+  var opt = makeOpt();
+  var annotations = {
+    // by RCID
+    patrolled: new Map(),
+    // by username
+    cvn: new Map(),
+    // by revision ID
+    ores: new Map()
+  };
+  var updateFeedTimeout;
+  var rcDayHeadPrev;
+  var skippedRCIDs = [];
+  var monthNames;
+  var prevFeedHtml;
+  var updateReq;
+  var currentDiff;
+  var currentDiffRcid;
 
   /**
    * Utility functions
@@ -116,11 +118,11 @@
    */
 
   function makeOpt () {
-    // Create a recursive copy of defOpt without exposing
-    // any of its arrays or objects in the returned value,
-    // so that the returned value can be modified in every way,
-    // without causing defOpt to change.
-    return $.extend(true, {}, defOpt);
+    // Create a recursive copy of RTRC_DEF_OPT without exposing
+    // any of its arrays or objects in the returned value.
+    // The returned value must be mutable in every way
+    // without causing RTRC_DEF_OPT to change.
+    return $.extend(true, {}, RTRC_DEF_OPT);
   }
 
   /**
@@ -460,7 +462,7 @@ Example:
     var reducedOpt = {};
 
     $.each(opt.rc, function (key, value) {
-      if (defOpt.rc[key] !== value) {
+      if (RTRC_DEF_OPT.rc[key] !== value) {
         if (!reducedOpt.rc) {
           reducedOpt.rc = {};
         }
@@ -470,7 +472,7 @@ Example:
 
     $.each(opt.app, function (key, value) {
       // Don't permalink MassPatrol (issue Krinkle/mw-rtrc-gadget#59)
-      if (key !== 'massPatrol' && defOpt.app[key] !== value) {
+      if (key !== 'massPatrol' && RTRC_DEF_OPT.app[key] !== value) {
         if (!reducedOpt.app) {
           reducedOpt.app = {};
         }
@@ -531,7 +533,7 @@ Example:
       // Rename values for old aliases
       for (var group in newOpt) {
         for (var oldKey in newOpt[group]) {
-          var newKey = aliasOpt[oldKey];
+          var newKey = RTRC_ALIAS_OPT[oldKey];
           if (newKey && !Object.hasOwnProperty.call(newOpt[group], newKey)) {
             newOpt[group][newKey] = newOpt[group][oldKey];
             delete newOpt[group][oldKey];
@@ -676,7 +678,7 @@ Example:
       dAnnotations = $.Deferred().resolve(annotations.ores);
     } else {
       dAnnotations = $.ajax({
-        url: oresApiUrl,
+        url: ORES_API_URL,
         data: {
           models: oresModel,
           // ORES v3 limits batches to 20 revisions.
@@ -754,7 +756,7 @@ Example:
       dAnnotations = $.Deferred().resolve(annotations.cvn);
     } else {
       dAnnotations = $.ajax({
-        url: cvnApiUrl,
+        url: CVN_API_URL,
         data: { users: users.join('|') },
         timeout: 2000,
         dataType: 'json',
@@ -837,7 +839,7 @@ Example:
 
     // Download recent changes
     updateReq = $.ajax({
-      url: apiUrl,
+      url: MW_API_URL,
       dataType: 'json',
       data: $.extend(getApiRcParams(opt.rc), {
         format: 'json',
@@ -868,7 +870,7 @@ Example:
             feedContentHTML += '<h3>Downloading recent changes failed</h3>' +
             '<p>Please check the settings above and try again. If you believe this is a bug, please <strong>' +
             '<a href="https://phabricator.wikimedia.org/maniphest/task/edit/form/1/?project=gadget-RTRC&description=' + encodeURIComponent('\n\n\n----' +
-            '\npackage: mw-gadget-rtrc ' + appVersion +
+            '\npackage: mw-gadget-rtrc ' + RTRC_VERSION +
             mw.format('\nbrowser: $1 $2 ($3)', client.name, client.version, client.platform)
             ) + '" target="_blank">let me know</a></strong>.';
           }
@@ -963,7 +965,7 @@ Example:
     $wrapper = $($.parseHTML(
       '<div class="mw-rtrc-wrapper">' +
       '<div class="mw-rtrc-head">' +
-        message('title').escaped() + ' <small>(' + appVersion + ')</small>' +
+        message('title').escaped() + ' <small>(' + RTRC_VERSION + ')</small>' +
         '<div class="mw-rtrc-head-links">' +
           (!mw.user.isAnon()
             ? ('<a target="_blank" href="' + mw.util.getUrl('Special:Log', { type: 'patrol', user: mw.user.getName(), subtype: 'patrol' }) + '">' +
@@ -1136,7 +1138,7 @@ Example:
           '<div class="mw-rtrc-feed-update"></div>' +
           '<div class="mw-rtrc-feed-content"></div>' +
         '</div>' +
-        '<img src="' + ajaxLoaderUrl + '" id="krRTRC_loader" style="display: none;">' +
+        '<img src="' + SPINNER_GIF_URL + '" id="krRTRC_loader" style="display: none;">' +
         '<div class="mw-rtrc-legend">' +
           message('legend').escaped() + ': ' +
           '<div class="mw-rtrc-item mw-rtrc-item-patrolled">' + mw.message('markedaspatrolled').escaped() + '</div>, ' +
@@ -1149,7 +1151,7 @@ Example:
         '<div class="plainlinks" style="text-align: right;">' +
           'Real-Time Recent Changes by ' +
           '<a href="https://meta.wikimedia.org/wiki/User:Krinkle">Krinkle</a>' +
-          ' | <a href="' + docUrl + '">' + message('documentation').escaped() + '</a>' +
+          ' | <a href="' + RTRC_DOC_URL + '">' + message('documentation').escaped() + '</a>' +
           ' | <a href="https://gerrit.wikimedia.org/g/mediawiki/gadgets/RTRC/+/master/CHANGELOG.md">' + message('changelog').escaped() + '</a>' +
           ' | <a href="https://phabricator.wikimedia.org/tag/gadget-rtrc/">' + message('feedback').escaped() + '</a>' +
         '</div>' +
@@ -1352,7 +1354,7 @@ Example:
       .attr('title', msg('helpicon-tooltip'))
       .on('click', function (e) {
         e.preventDefault();
-        window.open(docUrl + '#' + $(this).attr('section'), '_blank');
+        window.open(RTRC_DOC_URL + '#' + $(this).attr('section'), '_blank');
       });
 
     // Mark as patrolled when rollbacking
@@ -1446,7 +1448,7 @@ Example:
     );
 
     promises.push($.ajax({
-      url: apiUrl,
+      url: MW_API_URL,
       dataType: 'json',
       data: {
         format: 'json',
@@ -1460,7 +1462,7 @@ Example:
     }));
 
     promises.push($.ajax({
-      url: apiUrl,
+      url: MW_API_URL,
       dataType: 'json',
       data: {
         format: 'json',
@@ -1529,11 +1531,11 @@ Example:
     ]);
 
     if (!mw.libs.getIntuition) {
-      mw.libs.getIntuition = $.ajax({ url: intuitionLoadUrl, dataType: 'script', cache: true, timeout: 7000 });
+      mw.libs.getIntuition = $.ajax({ url: INTUITION_SCRIPT_URL, dataType: 'script', cache: true, timeout: 7000 });
     }
 
     var dOres = $.ajax({
-      url: oresApiUrl,
+      url: ORES_API_URL,
       dataType: 'json',
       cache: true,
       timeout: 2000
